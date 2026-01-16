@@ -7,7 +7,7 @@ from flask import Flask, request
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
-GITHUB_REPO = os.getenv("GITHUB_REPO")  # مثال: "username/falcon_bot_rules"
+GITHUB_REPO = os.getenv("GITHUB_REPO")
 GITHUB_FILE = "rules.json"
 
 URL = f"https://api.telegram.org/bot{TOKEN}/"
@@ -21,44 +21,77 @@ class PythonAI:
         self.load_rules()
 
     def load_rules(self):
-        headers = {"Authorization": f"token {GITHUB_TOKEN}"}
-        response = requests.get(GITHUB_API, headers=headers)
-        if response.status_code == 200:
-            content = response.json()["content"]
-            decoded = json.loads(requests.utils.unquote(content.encode()).decode("utf-8"))
-            self.rules = json.loads(decoded)
-        else:
+        try:
+            headers = {"Authorization": f"token {GITHUB_TOKEN}", "Accept": "application/vnd.github.v3.raw"}
+            response = requests.get(GITHUB_API, headers=headers)
+            if response.status_code == 200:
+                self.rules = response.json()
+            else:
+                # إذا لم يكن الملف موجودًا، نبدأ بقاموس فارغ
+                self.rules = {}
+        except Exception as e:
+            print(f"Error loading rules: {e}")
             self.rules = {}
 
     def save_rules(self):
-        headers = {"Authorization": f"token {GITHUB_TOKEN}"}
-        get_resp = requests.get(GITHUB_API, headers=headers)
-        sha = get_resp.json().get("sha") if get_resp.status_code == 200 else None
-        encoded = json.dumps(self.rules, ensure_ascii=False, indent=2)
-        data = {
-            "message": "update rules",
-            "content": encoded.encode("utf-8").decode("utf-8"),
-        }
-        if sha:
-            data["sha"] = sha
-        requests.put(GITHUB_API, headers=headers, json=data)
+        try:
+            headers = {"Authorization": f"token {GITHUB_TOKEN}", "Accept": "application/vnd.github.v3+json"}
+            
+            # أولاً، نحصل على SHA الحالي للملف لتجنب التعارضات
+            get_resp = requests.get(GITHUB_API, headers=headers)
+            sha = None
+            if get_resp.status_code == 200:
+                sha = get_resp.json().get("sha")
+
+            # تجهيز البيانات الجديدة
+            content_str = json.dumps(self.rules, ensure_ascii=False, indent=2)
+            
+            data = {
+                "message": "Update rules via bot",
+                "content": content_str,
+                "committer": {
+                    "name": "AI Bot",
+                    "email": "bot@example.com"
+                }
+            }
+            if sha:
+                data["sha"] = sha
+
+            # إرسال طلب التحديث
+            put_resp = requests.put(GITHUB_API, headers=headers, json=data)
+            if put_resp.status_code not in [200, 201]:
+                 print(f"Failed to save rules: {put_resp.status_code} - {put_resp.text}")
+
+        except Exception as e:
+            print(f"Error saving rules: {e}")
+
 
     def generate(self, prompt):
+        # الشرط المصحح: يجب أن يحتوي على "أضف" وعلامة "="
         if "أضف" in prompt and "=" in prompt:
             try:
-                key, code = prompt.split("=")
-                key, code = key.replace("أضف", "").strip(), code.strip()
+                key, code = prompt.split("=", 1) # نستخدم split مرة واحدة فقط
+                key = key.replace("أضف", "").strip()
+                code = code.strip()
+                
+                if not key: # التأكد من أن المفتاح ليس فارغًا
+                    return "⚠️ المفتاح لا يمكن أن يكون فارغًا."
+
                 self.rules[key] = code
                 self.save_rules()
                 return f"✅ تمت إضافة القاعدة: {key}"
-            except:
+            except ValueError:
                 return "⚠️ صيغة غير صحيحة. استخدم: أضف المفتاح = الكود"
 
-        if "اعرض القواعد" in prompt:
+        if prompt.strip() == "اعرض القواعد":
+            self.load_rules() # تحديث القواعد قبل العرض
             if not self.rules:
                 return "📂 لا توجد قواعد مخزنة بعد."
-            return "📂 القواعد المخزنة:\n" + "\n".join([f"- {k}" for k in self.rules.keys()])
+            # تحويل القواعد إلى نص منسق
+            rules_text = "\n".join([f"🔑 *{k}*:\n`{v}`" for k, v in self.rules.items()])
+            return f"📂 *القواعد المخزنة حاليًا:*\n\n{rules_text}"
 
+        # البحث عن قاعدة موجودة
         for key in self.rules:
             if key in prompt:
                 return self.rules[key]
@@ -74,12 +107,15 @@ def webhook():
         chat_id = data["message"]["chat"]["id"]
         text = data["message"].get("text", "")
         reply = ai.generate(text)
-        requests.post(URL + "sendMessage", json={"chat_id": chat_id, "text": reply})
+        # إرسال الرد مع تفعيل Markdown
+        requests.post(URL + "sendMessage", json={"chat_id": chat_id, "text": reply, "parse_mode": "Markdown"})
     return "ok"
 
 def set_webhook():
-    requests.get(f"{URL}setWebhook?url={WEBHOOK_URL}")
+    response = requests.get(f"{URL}setWebhook?url={WEBHOOK_URL}")
+    print(f"Webhook setup response: {response.json()}")
 
 if __name__ == "__main__":
     set_webhook()
-    app.run(host="0.0.0.0", port=10000)
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
+
