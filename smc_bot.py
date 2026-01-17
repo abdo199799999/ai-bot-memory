@@ -1,5 +1,5 @@
 # -----------------------------------------------------------------------------
-# smc_bot_v3.3.py - (SMC Sniper v3.3: Price Filter Scanner)
+# smc_bot_v4.1.py - (SMC Sniper v4.1: Transparent Status)
 # -----------------------------------------------------------------------------
 
 import os
@@ -17,47 +17,29 @@ logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s
 logger = logging.getLogger(__name__)
 app = Flask(__name__)
 
+# --- ذاكرة البوت للفرص المراقبة ---
+watched_opportunities = []
+
 # --- خادم الويب ---
 @app.route('/')
 def health_check():
-    return "SMC Sniper Bot Service (v3.3 - Price Filter) is Running!", 200
+    return "SMC Sniper Bot Service (v4.1 - Transparent Status) is Running!", 200
 def run_server():
     port = int(os.environ.get("PORT", 10000))
     app.run(host='0.0.0.0', port=port)
 
-# --- دالة جلب العملات (تم التعديل الجذري هنا) ---
+# --- (دوال التحليل وجلب العملات تبقى كما هي تمامًا) ---
 def get_filtered_usdt_pairs(client, max_price=100.0, top_n_by_volume=150):
-    """
-    يجلب كل عملات USDT، يفلترها حسب السعر، ثم يرتبها حسب حجم التداول.
-    """
     try:
         all_tickers = client.get_ticker()
-        
-        # 1. فلتر للحصول على عملات USDT فقط، واستبعاد عملات الرافعة المالية
-        usdt_pairs = [
-            t for t in all_tickers 
-            if t['symbol'].endswith('USDT') and 
-               'UP' not in t['symbol'] and 
-               'DOWN' not in t['symbol']
-        ]
-        
-        # 2. فلتر جديد: الاحتفاظ فقط بالعملات التي سعرها أقل من max_price
-        #    نتأكد من أن 'lastPrice' موجود وأن قيمته رقمية
-        cheap_pairs = [
-            p for p in usdt_pairs
-            if 'lastPrice' in p and float(p['lastPrice']) < max_price
-        ]
-        
-        # 3. ترتيب العملات الرخيصة حسب حجم التداول وأخذ أفضل 'top_n_by_volume' عملة
+        usdt_pairs = [t for t in all_tickers if t['symbol'].endswith('USDT') and 'UP' not in t['symbol'] and 'DOWN' not in t['symbol']]
+        cheap_pairs = [p for p in usdt_pairs if 'lastPrice' in p and float(p['lastPrice']) < max_price]
         sorted_pairs = sorted(cheap_pairs, key=lambda x: float(x['quoteVolume']), reverse=True)
-        
         return [p['symbol'] for p in sorted_pairs[:top_n_by_volume]]
-
     except Exception as e:
         logger.error(f"[Binance] فشل في جلب قائمة العملات المفلترة: {e}")
         return []
 
-# --- دوال التحليل (SMC) - تبقى كما هي ---
 def find_fvg(df):
     for i in range(len(df) - 3, 0, -1):
         prev_candle, next_candle = df.iloc[i-1], df.iloc[i+1]
@@ -99,67 +81,92 @@ def analyze_symbol_smc(client, symbol):
         logger.error(f"[SMC] خطأ أثناء فحص {symbol}: {e}")
     return None
 
-# --- مهمة الفحص الدوري (تستخدم الدالة الجديدة) ---
+# --- (مهمة الفحص الرئيسية ومهمة المراقبة السريعة تبقى كما هي) ---
 async def scan_for_smc_setup(context):
+    global watched_opportunities
     client = context.job.data['binance_client']
     chat_id = context.job.data['chat_id']
-    
-    logger.info("--- [SMC Sniper] بدء جولة الفحص (فلتر السعر < 100$) ---")
-    
-    # 1. جلب العملات النشطة التي سعرها أقل من 100$
+    logger.info("--- [SMC Sniper] بدء جولة الفحص الرئيسية (كل ساعة) ---")
     symbols_to_scan = get_filtered_usdt_pairs(client, max_price=100.0, top_n_by_volume=150)
-    if not symbols_to_scan:
-        logger.warning("--- [SMC Sniper] لم يتم العثور على عملات تطابق الفلتر. ---")
+    if not symbols_to_scan: return
+    for symbol in symbols_to_scan:
+        if any(opp['symbol'] == symbol for opp in watched_opportunities): continue
+        opportunity = analyze_symbol_smc(client, symbol)
+        if opportunity:
+            bos, fvg, price = opportunity['bos'], opportunity['fvg'], opportunity['current_price']
+            message = (f"🎯 *[SMC Sniper]* فرصة شراء احترافية محتملة!\n\n"
+                       f"• **العملة:** `{symbol}`\n"
+                       f"• **السعر الحالي:** `{price}`\n\n"
+                       f"• **التحليل:**\n"
+                       f"  1- تم كسر الهيكل عند سعر `{bos['price']}`.\n"
+                       f"  2- توجد فجوة سعرية (FVG) في منطقة الخصم.\n"
+                       f"  3- منطقة الدخول المحتملة: بين `{fvg['bottom']}` و `{fvg['top']}`.\n\n"
+                       f"سأقوم بمراقبة هذه المنطقة وسأرسل تنبيهًا عند دخول السعر إليها.")
+            await context.bot.send_message(chat_id=chat_id, text=message, parse_mode='Markdown')
+            watched_opportunities.append({"symbol": symbol, "fvg_top": fvg['top'], "fvg_bottom": fvg['bottom']})
+            logger.info(f"--- [SMC Sniper] تم العثور على فرصة في {symbol} وإضافتها للمراقبة. ---")
+        await asyncio.sleep(2)
+
+async def quick_check_watched(context):
+    global watched_opportunities
+    client = context.job.data['binance_client']
+    chat_id = context.job.data['chat_id']
+    if not watched_opportunities: return
+    logger.info(f"--- [Watcher] بدء جولة المراقبة السريعة لـ {len(watched_opportunities)} فرصة. ---")
+    for opp in list(watched_opportunities):
+        try:
+            ticker = client.get_symbol_ticker(symbol=opp['symbol'])
+            current_price = float(ticker['price'])
+            if opp['fvg_bottom'] <= current_price <= opp['fvg_top']:
+                message = (f"🔥 *[Watcher] تنبيه دخول!* 🔥\n\n"
+                           f"• **العملة:** `{opp['symbol']}`\n"
+                           f"• **السعر الآن (`{current_price}`) داخل منطقة الدخول التي حددناها!**\n"
+                           f"• **المنطقة:** بين `{opp['fvg_bottom']}` و `{opp['fvg_top']}`.\n\n"
+                           f"هذه قد تكون لحظة الدخول المناسبة.")
+                await context.bot.send_message(chat_id=chat_id, text=message, parse_mode='Markdown')
+                watched_opportunities.remove(opp)
+                logger.info(f"--- [Watcher] تم إرسال تنبيه دخول لـ {opp['symbol']} وإزالتها من المراقبة. ---")
+        except Exception as e:
+            logger.error(f"[Watcher] خطأ أثناء مراقبة {opp['symbol']}: {e}")
+        await asyncio.sleep(1)
+
+# --- أوامر البوت (تمت إضافة أمر /status هنا) ---
+async def start(update, context):
+    await update.message.reply_html("أهلاً بك! أنا **بوت SMC Sniper v4.1 (Transparent Status)**.\nأبحث عن فرص ثم أراقبها وأرسل تنبيهًا عند لحظة الدخول.\n\nاستخدم /status لمعرفة العملات التي أراقبها حاليًا.")
+
+async def status(update, context):
+    """يرسل قائمة بالعملات المراقبة حاليًا."""
+    global watched_opportunities
+    if not watched_opportunities:
+        await update.message.reply_text("✅ لا توجد عملات تحت المراقبة حاليًا.")
         return
 
-    logger.info(f"--- [SMC Sniper] سيتم فحص {len(symbols_to_scan)} عملة (نشطة وأقل من 100$). ---")
+    message = "--- *العملات تحت المراقبة* ---\n\n"
+    for opp in watched_opportunities:
+        message += (f"• **العملة:** `{opp['symbol']}`\n"
+                    f"  - **منطقة الدخول:** بين `{opp['fvg_bottom']}` و `{opp['fvg_top']}`\n\n")
     
-    found_opportunities = 0
-    for symbol in symbols_to_scan:
-        opportunity = analyze_symbol_smc(client, symbol)
-        
-        if opportunity:
-            found_opportunities += 1
-            bos, fvg, price = opportunity['bos'], opportunity['fvg'], opportunity['current_price']
-            
-            message = (
-                f"🎯 *[SMC Sniper]* فرصة شراء احترافية محتملة!\n\n"
-                f"• **العملة:** `{symbol}`\n"
-                f"• **السعر الحالي:** `{price}`\n\n"
-                f"• **التحليل:**\n"
-                f"  1- تم كسر الهيكل عند سعر `{bos['price']}`.\n"
-                f"  2- توجد فجوة سعرية (FVG) في منطقة الخصم.\n"
-                f"  3- منطقة الدخول المحتملة: بين `{fvg['bottom']}` و `{fvg['top']}`.\n\n"
-                f"راقب السعر عند وصوله لمنطقة الفجوة للدخول."
-            )
-            await context.bot.send_message(chat_id=chat_id, text=message, parse_mode='Markdown')
-        
-        await asyncio.sleep(2) 
+    await update.message.reply_text(message, parse_mode='Markdown')
 
-    if found_opportunities == 0:
-        logger.info(f"--- [SMC Sniper] لا توجد فرص واضحة في قائمة العملات المفلترة حاليًا ---")
-    else:
-        logger.info(f"--- [SMC Sniper] تم العثور على {found_opportunities} فرصة وإرسالها. ---")
-
-# --- أوامر البوت ودالة التشغيل الرئيسية ---
-async def start(update, context):
-    await update.message.reply_html("أهلاً بك! أنا **بوت SMC Sniper v3.3 (Price Filter)**.\nأبحث عن فرص الشراء في العملات النشطة التي يقل سعرها عن 100$.")
-
+# --- دالة تشغيل البوت (تم تعديلها لتسجيل الأمر الجديد) ---
 def run_bot():
-    # ... (الكود الخاص بإعدادات التيليجرام وبينانس يبقى كما هو) ...
     TELEGRAM_TOKEN, TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_TOKEN"), os.getenv("TELEGRAM_CHAT_ID")
     BINANCE_API_KEY, BINANCE_SECRET_KEY = os.getenv("BINANCE_API_KEY"), os.getenv("BINANCE_SECRET_KEY")
     
     application = Application.builder().token(TELEGRAM_TOKEN).build()
+    
+    # تسجيل الأوامر
     application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("status", status)) # <-- السطر الجديد
     
     client = Client(BINANCE_API_KEY, BINANCE_SECRET_KEY)
     job_data = {'binance_client': client, 'chat_id': TELEGRAM_CHAT_ID}
     
     job_queue = application.job_queue
     job_queue.run_repeating(scan_for_smc_setup, interval=60 * 60, first=10, data=job_data)
+    job_queue.run_repeating(quick_check_watched, interval=5 * 60, first=20, data=job_data)
     
-    logger.info("--- [SMC Bot] البوت جاهز ويعمل. ---")
+    logger.info("--- [SMC Bot] البوت جاهز ويعمل بكلتا المهمتين والأوامر. ---")
     application.run_polling()
 
 if __name__ == "__main__":
