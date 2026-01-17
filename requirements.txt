@@ -1,3 +1,5 @@
+python-binance
+pandas
 Flask
-requests
+python-telegram-bot[job-queue]
 
